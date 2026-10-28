@@ -284,6 +284,8 @@ fn auto_on_windows_with_an_intel_adapter_leaves_vulkan_out_of_the_instance() {
     for (p, os) in [
         (plan(Auto, None, Some("vulkan"), false, Os::Windows), Os::Windows),
         (plan(Auto, None, None, true, Os::Windows), Os::Windows),
+        (plan(Cpu, None, None, false, Os::Windows), Os::Windows),
+        (plan(Dx12, None, None, false, Os::Windows), Os::Windows),
         (plan(Vulkan, None, None, false, Os::Windows), Os::Windows),
         (plan(Auto, Some(&crashed("auto", "vulkan")), None, false, Os::Windows), Os::Windows),
         (plan(Auto, None, None, false, Os::Other), Os::Other),
@@ -297,6 +299,107 @@ fn auto_on_windows_with_an_intel_adapter_leaves_vulkan_out_of_the_instance() {
     assert_eq!(i, 0);
     assert_eq!(dx12_default_applied(&listed, i, Os::Windows, true), Some("Intel"));
     assert_eq!(dx12_default_applied(&listed, i, Os::Windows, false), None);
+}
+
+#[test]
+fn dxgi_scan_rules_out_intel_only_after_all_adapters_are_read() {
+    use std::cell::Cell;
+    let read = Cell::new(0);
+    let vendors = [0x10de, 0x1002, 0x1414, QUALCOMM_DXGI];
+    let scan = vendors.into_iter().map(|vendor| {
+        read.set(read.get() + 1);
+        Ok::<_, &str>(vendor)
+    });
+    assert_eq!(has_intel_vendor(scan), Ok(false));
+    assert_eq!(read.get(), vendors.len());
+    assert_eq!(has_intel_vendor(std::iter::empty::<Result<u32, &str>>()), Ok(false));
+}
+
+#[test]
+fn dxgi_scan_finds_intel_alone_or_after_a_discrete_adapter() {
+    for vendors in [vec![INTEL], vec![0x10de, INTEL], vec![0x1002, 0x1414, INTEL]] {
+        assert_eq!(has_intel_vendor(vendors.into_iter().map(Ok::<_, &str>)), Ok(true));
+    }
+}
+
+#[test]
+fn dxgi_scan_preserves_errors_instead_of_returning_a_partial_list() {
+    for error in ["adapter enumeration", "adapter description"] {
+        assert_eq!(has_intel_vendor([Err(error)]), Err(error));
+        assert_eq!(has_intel_vendor([Ok(0x10de), Err(error), Ok(INTEL)]), Err(error));
+    }
+}
+
+#[test]
+fn complete_non_intel_scan_skips_the_d3d12_probe() {
+    let auto = plan(Auto, None, None, false, Os::Windows);
+    for vendors in [vec![], vec![0x10de], vec![0x1002, 0x1414], vec![QUALCOMM_DXGI]] {
+        let scan = has_intel_vendor(vendors.into_iter().map(Ok::<_, &str>));
+        let selected =
+            windows_auto_backends(&auto, Os::Windows, || dx12_vendors_after_scan(scan, || panic!("a complete non-Intel scan must skip D3D12 initialization")));
+        assert_eq!(selected, None);
+    }
+}
+
+#[test]
+fn intel_scan_keeps_the_original_d3d12_capability_filter() {
+    use std::cell::Cell;
+    let auto = plan(Auto, None, None, false, Os::Windows);
+    for raw in [vec![INTEL], vec![0x10de, INTEL]] {
+        // A legacy Intel adapter (e.g. Haswell) can exist in DXGI but be excluded by wgpu.
+        // Keep that original answer, rather than treating every DXGI Intel adapter as DX12.
+        for filtered in [vec![INTEL, 0x1414], vec![0x10de, 0x1414], vec![]] {
+            let calls = Cell::new(0);
+            let selected = windows_auto_backends(&auto, Os::Windows, || {
+                let scan = has_intel_vendor(raw.iter().copied().map(Ok::<_, &str>));
+                let found = dx12_vendors_after_scan(scan, || {
+                    calls.set(calls.get() + 1);
+                    filtered.clone()
+                });
+                assert_eq!(found, filtered);
+                found
+            });
+            assert_eq!(calls.get(), 1);
+            let expected = filtered.contains(&INTEL).then_some(wgpu::Backends::DX12 | wgpu::Backends::GL);
+            assert_eq!(selected, expected);
+        }
+    }
+}
+
+#[test]
+fn detection_errors_keep_the_original_probe_and_its_backend_decision() {
+    use std::cell::Cell;
+    let auto = plan(Auto, None, None, false, Os::Windows);
+    let scans = [
+        Err("DXGI factory"),
+        has_intel_vendor([Err("adapter enumeration")]),
+        has_intel_vendor([Ok(0x10de), Err("adapter enumeration")]),
+        has_intel_vendor([Ok(0x1002), Err("adapter description")]),
+    ];
+    for scan in scans {
+        for filtered in [vec![INTEL], vec![0x10de], vec![]] {
+            let calls = Cell::new(0);
+            let selected = windows_auto_backends(&auto, Os::Windows, || {
+                dx12_vendors_after_scan(scan, || {
+                    calls.set(calls.get() + 1);
+                    filtered.clone()
+                })
+            });
+            assert_eq!(calls.get(), 1);
+            let expected = filtered.contains(&INTEL).then_some(wgpu::Backends::DX12 | wgpu::Backends::GL);
+            assert_eq!(selected, expected);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn native_dxgi_fast_path_preserves_the_d3d12_intel_decision() {
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backend_options.dx12.shader_compiler = dx12_compiler(None, None);
+    let original = wgpu_dx12_vendors(&desc);
+    let guarded = dx12_vendors(&desc);
+    assert_eq!(guarded.contains(&INTEL), original.contains(&INTEL));
 }
 
 #[test]
