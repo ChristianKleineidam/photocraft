@@ -46,10 +46,26 @@ impl PhotocraftApp {
 }
 
 impl PhotocraftApp {
-    /// Install fonts, image loaders and the theme. Call from the app creator (and again for a
-    /// replacement Context) before the first `run_ui` so the very first frame renders and the
-    /// Type reset begin/end pass markers exist; otherwise `logic` does it and the first frame is
-    /// skipped, with the begin-pass marker necessarily starting on the following pass.
+    /// Prepare this app's context in the app creator, before the first egui pass.
+    ///
+    /// Font definitions take effect at the next begin-pass. Installing them here lets the first
+    /// UI pass draw the editor instead of presenting a blank font-setup frame. Saved language
+    /// and font size are applied before registration, avoiding a second startup font rebuild.
+    /// Call again before the first pass of a replacement context. Hosts that omit this retain
+    /// the deferred setup in `logic_frame`.
+    pub fn prepare_first_frame(&mut self, ctx: &egui::Context) {
+        theme::set_ui_font_size(ctx, self.session.prefs().interface.ui_font_size);
+        crate::i18n::sync_context(ctx, &self.session.prefs().interface.language);
+        Self::setup_context(ctx, self.ui.theme);
+        self.styled = true;
+        self.fonts_ready = false;
+    }
+
+    /// Install fonts, image loaders, theme and Type reset pass markers on a context.
+    ///
+    /// This only registers context resources. App creators should use [`Self::prepare_first_frame`]
+    /// to also mark the app as prepared; otherwise `logic_frame` repeats setup and skips its
+    /// first editor frame. Registration during a pass takes effect on the following pass.
     pub fn setup_context(ctx: &egui::Context, kind: theme::ThemeKind) {
         Self::install_type_reset_hooks(ctx);
         ctx.add_plugin(tool_cursor::CursorLifecycle);
