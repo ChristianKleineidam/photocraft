@@ -13,9 +13,10 @@
 //!
 //! The choice that worked is remembered in `performance.gpuBackend` (Preferences › Performance,
 //! where it can be reset). With `auto`, Intel and Qualcomm (Windows on ARM) adapters on Windows
-//! use DX12, and when DXGI lists an Intel adapter the instance leaves Vulkan out, so the first
-//! start doesn't load the Intel Vulkan driver either. `WGPU_BACKEND` still overrides everything,
-//! and `--safe-gpu` forces the CPU path for one launch.
+//! use DX12. A complete DXGI scan without Intel skips the temporary DX12 probe; finding Intel
+//! or a scan error retains wgpu's capability-filtered probe. When that probe lists Intel, the
+//! instance leaves Vulkan out, so the first start doesn't load the Intel Vulkan driver either.
+//! `WGPU_BACKEND` still overrides everything, and `--safe-gpu` forces the CPU path for one launch.
 //!
 //! "CPU" composites on the CPU and draws the window with a software adapter where the platform
 //! has one (WARP on Windows, llvmpipe over GL elsewhere). On Linux a GL adapter that can't present
@@ -235,6 +236,11 @@ fn dx12_vendors(desc: &wgpu::InstanceDescriptor) -> Vec<u32> {
     }
 }
 
+/// Skip `probe` only when the DXGI scan successfully rules Intel out.
+///
+/// The empty result is evidence that Intel is absent, not a complete adapter list. Intel or
+/// an inconclusive scan calls `probe` exactly once and returns its capability-filtered list
+/// unchanged, so legacy Intel adapters keep the original backend decision.
 #[cfg(any(windows, test))]
 fn dx12_vendors_after_scan<E>(intel: Result<bool, E>, probe: impl FnOnce() -> Vec<u32>) -> Vec<u32> {
     match intel {
@@ -243,8 +249,11 @@ fn dx12_vendors_after_scan<E>(intel: Result<bool, E>, probe: impl FnOnce() -> Ve
     }
 }
 
-/// Only a successful scan through the end of the iterator can rule Intel out. Errors after
-/// earlier non-Intel entries must not become a partial vendor list that re-enables Vulkan.
+/// Read vendor IDs until Intel is found, the first error occurs, or the scan completes.
+///
+/// `Ok(false)` requires successful exhaustion, including an empty scan. `Ok(true)` and `Err`
+/// both retain the original probe, so neither needs to inspect later adapters. Errors after
+/// earlier non-Intel entries must not become a partial list that re-enables Vulkan.
 #[cfg(any(windows, test))]
 fn has_intel_vendor<E>(vendors: impl IntoIterator<Item = Result<u32, E>>) -> Result<bool, E> {
     for vendor in vendors {
@@ -255,14 +264,22 @@ fn has_intel_vendor<E>(vendors: impl IntoIterator<Item = Result<u32, E>>) -> Res
     Ok(false)
 }
 
+/// Query DXGI vendor IDs without creating a D3D12 device or loading a Vulkan driver.
+///
+/// Factory, enumeration and descriptor failures propagate to the original wgpu probe. The
+/// winsafe iterator treats only `DXGI_ERROR_NOT_FOUND` as successful end-of-enumeration; its
+/// other failures remain errors. COM handles are released when the scan returns.
 #[cfg(windows)]
 fn dxgi_has_intel() -> Result<bool, winsafe::co::HRESULT> {
-    use winsafe::prelude::*;
+    use winsafe::prelude::{dxgi_IDXGIAdapter1, dxgi_IDXGIFactory1};
     let factory = winsafe::CreateDXGIFactory1()?;
     has_intel_vendor(factory.EnumAdapters1().map(|adapter| Ok(adapter?.GetDesc1()?.VendorId)))
 }
 
-/// The original capability-filtered DX12 vendor list. This never creates a Vulkan instance.
+/// Run the original capability-filtered DX12 probe with the caller's flags and compiler.
+///
+/// Raw DXGI presence does not prove that wgpu can use an adapter (e.g. legacy Intel Haswell).
+/// This fallback preserves that filtering and never creates a Vulkan instance.
 fn wgpu_dx12_vendors(desc: &wgpu::InstanceDescriptor) -> Vec<u32> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::DX12,

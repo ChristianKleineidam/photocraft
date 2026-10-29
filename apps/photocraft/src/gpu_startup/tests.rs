@@ -1,6 +1,10 @@
 use super::*;
 use GpuBackend::*;
 
+const NVIDIA: u32 = 0x10de;
+const AMD: u32 = 0x1002;
+const WARP: u32 = 0x1414;
+
 fn crashed(backend: &str, adapter_backend: &str) -> Marker {
     Marker { backend: backend.into(), adapter: "Intel(R) UHD Graphics".into(), adapter_backend: adapter_backend.into(), ..Default::default() }
 }
@@ -266,9 +270,6 @@ fn qualcomm_on_windows_defaults_to_dx12() {
 #[test]
 fn auto_on_windows_with_an_intel_adapter_leaves_vulkan_out_of_the_instance() {
     use wgpu::{Backend as B, DeviceType as T};
-    const NVIDIA: u32 = 0x10de;
-    const AMD: u32 = 0x1002;
-    const WARP: u32 = 0x1414;
     let auto = plan(Auto, None, None, false, Os::Windows);
     let dx12_gl = Some(wgpu::Backends::DX12 | wgpu::Backends::GL);
     assert_eq!(windows_auto_backends(&auto, Os::Windows, || vec![INTEL, WARP]), dx12_gl);
@@ -301,11 +302,13 @@ fn auto_on_windows_with_an_intel_adapter_leaves_vulkan_out_of_the_instance() {
     assert_eq!(dx12_default_applied(&listed, i, Os::Windows, false), None);
 }
 
+/// Ruling Intel out requires reading every adapter, including software and Qualcomm entries.
+/// An empty successful enumeration also rules Intel out.
 #[test]
 fn dxgi_scan_rules_out_intel_only_after_all_adapters_are_read() {
     use std::cell::Cell;
     let read = Cell::new(0);
-    let vendors = [0x10de, 0x1002, 0x1414, QUALCOMM_DXGI];
+    let vendors = [NVIDIA, AMD, WARP, QUALCOMM_DXGI];
     let scan = vendors.into_iter().map(|vendor| {
         read.set(read.get() + 1);
         Ok::<_, &str>(vendor)
@@ -315,40 +318,51 @@ fn dxgi_scan_rules_out_intel_only_after_all_adapters_are_read() {
     assert_eq!(has_intel_vendor(std::iter::empty::<Result<u32, &str>>()), Ok(false));
 }
 
+/// Intel triggers the original probe regardless of adapter ordering. Once found, later
+/// adapters cannot change that decision and must not be queried.
 #[test]
 fn dxgi_scan_finds_intel_alone_or_after_a_discrete_adapter() {
-    for vendors in [vec![INTEL], vec![0x10de, INTEL], vec![0x1002, 0x1414, INTEL]] {
-        assert_eq!(has_intel_vendor(vendors.into_iter().map(Ok::<_, &str>)), Ok(true));
+    for vendors in [vec![INTEL], vec![NVIDIA, INTEL], vec![AMD, WARP, INTEL]] {
+        let scan = vendors.iter().copied().map(Ok::<_, &str>);
+        let after_intel = std::iter::from_fn(|| -> Option<Result<u32, &str>> { panic!("no adapter should be queried after Intel is found") });
+        assert_eq!(has_intel_vendor(scan.chain(after_intel)), Ok(true), "vendors: {vendors:?}");
     }
 }
 
+/// Enumeration and descriptor errors must propagate even after valid non-Intel adapters;
+/// no later entry may hide an inconclusive scan or turn it into a successful partial list.
 #[test]
 fn dxgi_scan_preserves_errors_instead_of_returning_a_partial_list() {
     for error in ["adapter enumeration", "adapter description"] {
         assert_eq!(has_intel_vendor([Err(error)]), Err(error));
-        assert_eq!(has_intel_vendor([Ok(0x10de), Err(error), Ok(INTEL)]), Err(error));
+        let scan = [Ok(NVIDIA), Err(error)].into_iter();
+        let after_error = std::iter::from_fn(|| -> Option<Result<u32, &str>> { panic!("no adapter should be queried after a detection error") });
+        assert_eq!(has_intel_vendor(scan.chain(after_error)), Err(error));
     }
 }
 
+/// The non-Intel fast path must never initialize D3D12 or override the automatic backends.
 #[test]
 fn complete_non_intel_scan_skips_the_d3d12_probe() {
     let auto = plan(Auto, None, None, false, Os::Windows);
-    for vendors in [vec![], vec![0x10de], vec![0x1002, 0x1414], vec![QUALCOMM_DXGI]] {
-        let scan = has_intel_vendor(vendors.into_iter().map(Ok::<_, &str>));
+    for vendors in [vec![], vec![NVIDIA], vec![AMD, WARP], vec![QUALCOMM_DXGI]] {
+        let scan = has_intel_vendor(vendors.iter().copied().map(Ok::<_, &str>));
         let selected =
             windows_auto_backends(&auto, Os::Windows, || dx12_vendors_after_scan(scan, || panic!("a complete non-Intel scan must skip D3D12 initialization")));
-        assert_eq!(selected, None);
+        assert_eq!(selected, None, "vendors: {vendors:?}");
     }
 }
 
+/// Intel-only and hybrid systems must call the original probe once and preserve its filtered
+/// list, including when it rejects a legacy Intel adapter or returns no usable adapters.
 #[test]
 fn intel_scan_keeps_the_original_d3d12_capability_filter() {
     use std::cell::Cell;
     let auto = plan(Auto, None, None, false, Os::Windows);
-    for raw in [vec![INTEL], vec![0x10de, INTEL]] {
+    for raw in [vec![INTEL], vec![NVIDIA, INTEL]] {
         // A legacy Intel adapter (e.g. Haswell) can exist in DXGI but be excluded by wgpu.
         // Keep that original answer, rather than treating every DXGI Intel adapter as DX12.
-        for filtered in [vec![INTEL, 0x1414], vec![0x10de, 0x1414], vec![]] {
+        for filtered in [vec![INTEL, WARP], vec![NVIDIA, WARP], vec![]] {
             let calls = Cell::new(0);
             let selected = windows_auto_backends(&auto, Os::Windows, || {
                 let scan = has_intel_vendor(raw.iter().copied().map(Ok::<_, &str>));
@@ -356,16 +370,18 @@ fn intel_scan_keeps_the_original_d3d12_capability_filter() {
                     calls.set(calls.get() + 1);
                     filtered.clone()
                 });
-                assert_eq!(found, filtered);
+                assert_eq!(found, filtered, "raw DXGI vendors: {raw:?}");
                 found
             });
-            assert_eq!(calls.get(), 1);
+            assert_eq!(calls.get(), 1, "raw DXGI vendors: {raw:?}");
             let expected = filtered.contains(&INTEL).then_some(wgpu::Backends::DX12 | wgpu::Backends::GL);
-            assert_eq!(selected, expected);
+            assert_eq!(selected, expected, "raw DXGI vendors: {raw:?}; filtered: {filtered:?}");
         }
     }
 }
 
+/// Every detection failure must call the original probe exactly once, whose Intel result
+/// alone decides whether Vulkan is excluded, including failures after non-Intel entries.
 #[test]
 fn detection_errors_keep_the_original_probe_and_its_backend_decision() {
     use std::cell::Cell;
@@ -373,11 +389,11 @@ fn detection_errors_keep_the_original_probe_and_its_backend_decision() {
     let scans = [
         Err("DXGI factory"),
         has_intel_vendor([Err("adapter enumeration")]),
-        has_intel_vendor([Ok(0x10de), Err("adapter enumeration")]),
-        has_intel_vendor([Ok(0x1002), Err("adapter description")]),
+        has_intel_vendor([Ok(NVIDIA), Err("adapter enumeration")]),
+        has_intel_vendor([Ok(AMD), Err("adapter description")]),
     ];
     for scan in scans {
-        for filtered in [vec![INTEL], vec![0x10de], vec![]] {
+        for filtered in [vec![INTEL], vec![NVIDIA], vec![]] {
             let calls = Cell::new(0);
             let selected = windows_auto_backends(&auto, Os::Windows, || {
                 dx12_vendors_after_scan(scan, || {
@@ -385,13 +401,15 @@ fn detection_errors_keep_the_original_probe_and_its_backend_decision() {
                     filtered.clone()
                 })
             });
-            assert_eq!(calls.get(), 1);
+            assert_eq!(calls.get(), 1, "scan: {scan:?}; filtered: {filtered:?}");
             let expected = filtered.contains(&INTEL).then_some(wgpu::Backends::DX12 | wgpu::Backends::GL);
-            assert_eq!(selected, expected);
+            assert_eq!(selected, expected, "scan: {scan:?}; filtered: {filtered:?}");
         }
     }
 }
 
+/// Compare the guarded and original Intel decisions on real Windows adapters without loading
+/// Vulkan. Physical Intel and hybrid configurations still need separate hardware validation.
 #[cfg(windows)]
 #[test]
 fn native_dxgi_fast_path_preserves_the_d3d12_intel_decision() {
