@@ -98,8 +98,9 @@ Rust test and variable work on Windows with the native shell's environment-varia
 ## Fonts (craft-fonts)
 
 The desktop app calls `PhotocraftApp::prepare_first_frame` in its app creator, after loading
-preferences and before egui's first pass. This registers UI fonts with the saved language and
-font size early enough to draw the editor in the first presentation. Hosts that cannot prepare
+preferences and before egui's first pass. This initializes saved UI zoom against the host's
+native DPI, and registers UI fonts with the saved language and font size early enough to draw
+the editor at the correct scale in the first presentation. Hosts that cannot prepare
 their context early retain deferred setup and skip their first editor pass. Type-tool system
 font discovery continues on its background thread.
 

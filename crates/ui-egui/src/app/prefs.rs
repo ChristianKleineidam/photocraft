@@ -49,11 +49,16 @@ impl PhotocraftApp {
     /// Prepare this app's context in the app creator, before the first egui pass.
     ///
     /// Font definitions take effect at the next begin-pass. Installing them here lets the first
-    /// UI pass draw the editor instead of presenting a blank font-setup frame. Saved language
-    /// and font size are applied before registration, avoiding a second startup font rebuild.
+    /// UI pass draw the editor instead of presenting a blank font-setup frame. Saved UI scale,
+    /// language and font size are applied before registration, avoiding startup resizing and
+    /// another font rebuild. The host must supply native DPI before preparation, as eframe does.
     /// Call again before the first pass of a replacement context. Hosts that omit this retain
     /// the deferred setup in `logic_frame`.
     pub fn prepare_first_frame(&mut self, ctx: &egui::Context) {
+        let zoom = crate::prefs_ui::display_zoom(self.session.prefs().interface.ui_scale, ctx.native_pixels_per_point());
+        // Initialize before begin-pass rather than queue a runtime zoom change: queued zoom
+        // rescales the previous content rect, which does not yet describe this new window.
+        ctx.options_mut(|options| options.zoom_factor = zoom);
         theme::set_ui_font_size(ctx, self.session.prefs().interface.ui_font_size);
         crate::i18n::sync_context(ctx, &self.session.prefs().interface.language);
         Self::setup_context(ctx, self.ui.theme);

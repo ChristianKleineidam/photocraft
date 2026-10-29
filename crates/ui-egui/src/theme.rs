@@ -973,6 +973,8 @@ impl egui::Plugin for UiFontSizePlugin {
         "photocraft-ui-font-size"
     }
 
+    /// Rescale only active font definitions, after any pending installation has landed, and
+    /// keep on-demand fallback faces at the same scale as the next pass's registered fonts.
     fn output_hook(&mut self, ctx: &egui::Context, _output: &mut egui::FullOutput) {
         let size = ui_font_size(ctx);
         let deferred = std::mem::take(&mut self.defer_after_install);
