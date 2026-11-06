@@ -1,0 +1,78 @@
+name: Windows validation for PhotoCraft PR 10000
+run-name: Windows unit and integration tests for 854c4b0
+
+on:
+  push:
+    branches: [ci/windows-pr-10000-854c4b0]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PHOTOCRAFT_NO_PRINT: "1"
+  LPDEST: photocraft-no-such-printer
+  PHOTOCRAFT_PR_HEAD: 854c4b022171b941c5bd2d8bcad3eb548fe1f8e4
+
+jobs:
+  windows:
+    timeout-minutes: 100
+    name: test (windows-latest, ${{ matrix.part }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [unit, integration]
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+      CRAFT_FONTS_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.PHOTOCRAFT_PR_HEAD }}
+          persist-credentials: false
+
+      - name: Verify PR commit
+        shell: pwsh
+        run: |
+          $testedHead = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $testedHead -ne $env:PHOTOCRAFT_PR_HEAD) {
+            throw "Checkout does not match the requested PR commit"
+          }
+          "Testing PhotoCraft commit $testedHead" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY
+
+      - name: Check out craft-fonts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-fonts
+          ref: b076417b5880bd4154bd22f00695b1d28c6bea83
+          path: craft-fonts
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: clippy
+
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-nextest@0.9.150
+
+      # The unit leg runs `--lib --bins` and the integration leg `--test '*'` (every
+      # integration-test target); the feature selection stays the same, so both legs share the
+      # dependency cache.
+      - name: Test
+        env:
+          PART: ${{ matrix.part }}
+        run: |
+          case "$PART" in
+            unit) targets=(--lib --bins) ;;
+            *) targets=(--test '*') ;;
+          esac
+          cargo nextest run --profile ci --workspace --locked --features heif "${targets[@]}"
+        shell: bash
+
+      - name: Doctests
+        if: matrix.part == 'unit'
+        run: cargo test --workspace --locked --features heif --doc
